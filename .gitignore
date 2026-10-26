@@ -1,0 +1,10 @@
+# Build output
+out/
+*.class
+
+# IDE
+.idea/
+*.iml.bak
+
+# OS
+.DS_Store
