@@ -380,12 +380,68 @@ public final class ProxyHandler implements HttpHandler {
             if (STRIP_RESPONSE.contains(name.toLowerCase(Locale.ROOT))) {
                 continue;
             }
+            if (!isValidHeaderName(name)) {
+                // drops HTTP/2 pseudo-headers (":status" and friends) and any
+                // other name that is not a valid HTTP/1.1 field-name; strict
+                // clients (undici/llhttp) reject them with "Invalid header token"
+                continue;
+            }
             for (String v : e.getValue()) {
-                if (v != null && !v.isEmpty()) {
-                    out.add(name, v);
+                String clean = sanitizeHeaderValue(v);
+                if (!clean.isEmpty()) {
+                    out.add(name, clean);
                 }
             }
         }
+    }
+
+    /** RFC 7230 field-name: non-empty token, not starting with ":". */
+    private static boolean isValidHeaderName(String name) {
+        if (name == null || name.isEmpty() || name.charAt(0) == ':') {
+            return false;
+        }
+        for (int i = 0; i < name.length(); i++) {
+            if (!isTokenChar(name.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isTokenChar(char c) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            return true;
+        }
+        switch (c) {
+            case '!': case '"': case '#': case '$': case '%': case '&': case '\'': case '*':
+            case '+': case '-': case '.': case '/': case ':': case '<': case '=': case '>':
+            case '^': case '_': case '`': case '|': case '~':
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** Strips CR/LF and other control characters so a value can never
+     *  split into a bogus header line on the wire. */
+    private static String sanitizeHeaderValue(String v) {
+        if (v == null) {
+            return "";
+        }
+        StringBuilder sb = null;
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            boolean keep = c == '\t' || (c >= 0x20 && c != 0x7f);
+            if (!keep) {
+                if (sb == null) {
+                    sb = new StringBuilder(v.length());
+                }
+            } else if (sb != null) {
+                sb.append(c);
+            }
+        }
+        String out = sb == null ? v : sb.toString();
+        return out.strip();
     }
 
     /** Writes a fully-buffered response to the client. */

@@ -41,6 +41,35 @@ stream** — never a partial one and never duplicated tokens.
   duplicate tokens the client already saw. 5xx responses are captured in
   memory and retried before anything is shown to the client.
 
+## Full HTTP transparency
+
+The proxy is method-, path- and content-type-agnostic. Anything an
+OpenAI-compatible backend serves, it forwards:
+
+- **Methods**: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`
+  all pass through (verified end to end).
+- **Paths and query strings** are appended to the upstream base verbatim,
+  so the entire API surface of the backend is reachable:
+  `/chat/completions`, `/completions`, `/embeddings`, `/audio/*`,
+  `/images/*`, `/files`, `/models`, fine-tuning, and anything else the
+  backend exposes.
+- **Bodies** are forwarded byte-exact in both directions: JSON, SSE,
+  `multipart/form-data` (file uploads, audio), and binary responses
+  (images, audio) all work unmodified.
+
+Responses are framed as strict HTTP/1.1 so any client can parse them:
+
+- hop-by-hop and framing headers are stripped and re-set by the proxy
+  (`Content-Length` / chunked as appropriate);
+- HTTP/2 pseudo-headers (`:status` and friends) from an H2 upstream are
+  dropped — strict parsers (undici/Node fetch, curl, browsers) reject them;
+- header values are sanitized of CR/LF and control characters so no
+  forwarded header can split into a bogus line on the wire.
+
+The same proxy fronts any number of backends — OpenAI, Z.ai, a local vLLM,
+SGLang, or llama.cpp `server` — by setting `RAI_PROXY_UPSTREAM` per
+process or `X-Proxy-Upstream` per request.
+
 ## Retry rules
 
 Retried:
@@ -87,15 +116,23 @@ Or from a shell:
 ./run.sh
 ```
 
-Point any OpenAI-compatible client at `http://localhost:8000/v1`:
+Point any OpenAI-compatible client at `http://localhost:8000`:
 
 ```sh
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8000/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer whatever' \
   -d '{"model":"gpt-4o","stream":true,
        "messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+**Path convention.** The proxy forwards `RAI_PROXY_UPSTREAM + client_path`
+verbatim. The upstream base already carries the version prefix (e.g.
+`https://api.openai.com/v1`, `https://api.z.ai/api/paas/v4`), so the client
+path must **not** repeat it: call `/chat/completions`, not
+`/v1/chat/completions`. If your upstream base has no version prefix (e.g. a
+bare vLLM host), include it in the client path instead — the rule is simply
+"whatever the upstream server expects after its base URL".
 
 `/health` returns proxy status without touching the upstream.
 
