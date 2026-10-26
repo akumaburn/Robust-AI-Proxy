@@ -8,3 +8,6 @@ out/
 
 # OS
 .DS_Store
+
+# local launcher with embedded API key - never commit
+zai.sh
