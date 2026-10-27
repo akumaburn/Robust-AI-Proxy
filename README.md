@@ -98,6 +98,27 @@ OpenAI-style 502:
 Responses carry an `X-Proxy-Attempts` header showing how many upstream
 attempts were made.
 
+## Rate limits (429)
+
+When the upstream answers 429 ("usage limit reached"), the proxy holds the
+client connection open and sleeps until the provider's usage window resets,
+then re-sends the request. The client experiences one long request, not an
+error — the same transparency as an idle-timeout retry, just longer.
+
+The reset time is resolved, in order:
+
+1. `Retry-After` response header (delta-seconds or HTTP-date)
+2. a `YYYY-MM-DD HH:MM:SS` timestamp in the body (Z.ai phrases it as
+   `Your limit will reset at ...`), interpreted in the proxy's local
+   timezone
+3. neither present: the 429 is forwarded to the client verbatim, so the
+   client can decide
+
+Multiple consecutive windows are absorbed one after another.
+`RAI_PROXY_RATE_LIMIT_WAIT=false` disables the wait;
+`RAI_PROXY_MAX_RATE_LIMIT_WAIT_SECONDS` (default 86400) caps any single
+sleep, after which the proxy simply retries and re-measures.
+
 ## Quick start
 
 Open the folder in IntelliJ IDEA (the `.iml` marks `src` as the source
@@ -153,6 +174,8 @@ System properties (`-Dname=...`) override environment variables
 | `retryBackoffMs` / `RAI_PROXY_RETRY_BACKOFF_MS` | `500` | delay between attempts |
 | `streamMode` / `RAI_PROXY_STREAM_MODE` | `buffer` | `buffer` or `passthrough` |
 | `requireDone` / `RAI_PROXY_REQUIRE_DONE` | `true` | treat a stream ending without `data: [DONE]` as incomplete (buffer mode) |
+| `rateLimitWait` / `RAI_PROXY_RATE_LIMIT_WAIT` | `true` | on 429, hold the client open and sleep until the provider reset |
+| `maxRateLimitWaitSeconds` / `RAI_PROXY_MAX_RATE_LIMIT_WAIT_SECONDS` | `86400` | cap for a single 429 sleep |
 
 Per-request overrides:
 

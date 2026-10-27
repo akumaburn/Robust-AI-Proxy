@@ -20,11 +20,14 @@ public final class Config {
     public final int maxRetries;      // -1 = unlimited, 0 = none, N = retries after the first attempt
     public final long retryBackoffMs;
     public final String streamMode;   // "buffer" or "passthrough"
-    public final boolean requireDone; // require a terminal "data: [DONE]" for SSE responses
+    public final boolean requireDone;  // require a terminal "data: [DONE]" for SSE responses
+    public final boolean rateLimitWait;     // on 429: hold the client open and sleep until the provider reset
+    public final long maxRateLimitWaitMs;    // cap for a single 429 sleep
 
     private Config(int port, String bind, String upstream, String apiKey,
                    long idleTimeoutMs, long totalTimeoutMs, int maxRetries,
-                   long retryBackoffMs, String streamMode, boolean requireDone) {
+                   long retryBackoffMs, String streamMode, boolean requireDone,
+                   boolean rateLimitWait, long maxRateLimitWaitMs) {
         this.port = port;
         this.bind = bind;
         this.upstream = upstream;
@@ -35,6 +38,8 @@ public final class Config {
         this.retryBackoffMs = retryBackoffMs;
         this.streamMode = streamMode;
         this.requireDone = requireDone;
+        this.rateLimitWait = rateLimitWait;
+        this.maxRateLimitWaitMs = maxRateLimitWaitMs;
     }
 
     public static Config fromSystem() {
@@ -48,6 +53,8 @@ public final class Config {
         long backoff = longProp("retryBackoffMs", "RAI_PROXY_RETRY_BACKOFF_MS", 500);
         String mode = strProp("streamMode", "RAI_PROXY_STREAM_MODE", "buffer").toLowerCase(Locale.ROOT);
         boolean requireDone = boolProp("requireDone", "RAI_PROXY_REQUIRE_DONE", true);
+        boolean rateLimitWait = boolProp("rateLimitWait", "RAI_PROXY_RATE_LIMIT_WAIT", true);
+        long maxRateLimitWait = longProp("maxRateLimitWaitSeconds", "RAI_PROXY_MAX_RATE_LIMIT_WAIT_SECONDS", 86400);
 
         if (port < 1 || port > 65535) {
             throw new IllegalStateException("port out of range: " + port);
@@ -61,22 +68,27 @@ public final class Config {
         if (backoff < 0) {
             throw new IllegalStateException("retry backoff must be >= 0");
         }
+        if (maxRateLimitWait < 1) {
+            throw new IllegalStateException("max rate-limit wait must be at least 1 second");
+        }
         if (!mode.equals("buffer") && !mode.equals("passthrough")) {
             throw new IllegalStateException("streamMode must be 'buffer' or 'passthrough', got: " + mode);
         }
 
         return new Config(port, bind, stripTrailingSlash(upstream), apiKey,
-                idle * 1000, total * 1000, maxRetries, backoff, mode, requireDone);
+                idle * 1000, total * 1000, maxRetries, backoff, mode, requireDone,
+                rateLimitWait, maxRateLimitWait * 1000);
     }
 
     /** One-line summary for the startup log. The API key is never printed. */
     public static String describe(Config c) {
         return String.format(
-                "port=%d bind=%s upstream=%s mode=%s idle=%ss total=%s maxRetries=%s backoff=%dms requireDone=%b apiKey=%s",
+                "port=%d bind=%s upstream=%s mode=%s idle=%ss total=%s maxRetries=%s backoff=%dms requireDone=%b rateLimitWait=%b maxRateLimitWait=%ds apiKey=%s",
                 c.port, c.bind, c.upstream, c.streamMode, c.idleTimeoutMs / 1000,
                 c.totalTimeoutMs == 0 ? "off" : (c.totalTimeoutMs / 1000) + "s",
                 c.maxRetries < 0 ? "unlimited" : String.valueOf(c.maxRetries),
-                c.retryBackoffMs, c.requireDone, c.apiKey.isEmpty() ? "<unset>" : "<set>");
+                c.retryBackoffMs, c.requireDone, c.rateLimitWait, c.maxRateLimitWaitMs / 1000,
+                c.apiKey.isEmpty() ? "<unset>" : "<set>");
     }
 
     private static String stripTrailingSlash(String s) {

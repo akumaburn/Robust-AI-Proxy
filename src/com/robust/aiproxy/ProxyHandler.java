@@ -10,11 +10,17 @@ import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Handles one client request end to end:
@@ -125,7 +131,17 @@ public final class ProxyHandler implements HttpHandler {
                     int st = out.status();
                     byte[] bytes = buf.toByteArray();
                     if (st >= 400 && st < 500) {
-                        // deterministic client error: forward verbatim, no retry
+                        if (st == 429 && cfg.rateLimitWait && canRetry(attempts)) {
+                            long waitMs = rateLimitWaitMs(out.headers(), bytes);
+                            if (waitMs > 0) {
+                                long capped = Math.min(waitMs, cfg.maxRateLimitWaitMs);
+                                Log.warn("attempt %d: 429 rate limit; holding client open, sleeping %ds until provider reset",
+                                        attempts, capped / 1000);
+                                sleepMs(capped);
+                                continue;
+                            }
+                        }
+                        // deterministic client error (or 429 without reset info): forward verbatim
                         sendBody(ex, st, out.headers(), bytes, attempts);
                         return;
                     }
@@ -191,7 +207,17 @@ public final class ProxyHandler implements HttpHandler {
                     if (sink.committed) {
                         return;
                     }
-                    // 5xx body was captured but not shown to the client
+                    // captured 5xx / 429 body was not shown to the client
+                    if (out.status() == 429 && cfg.rateLimitWait && canRetry(attempts)) {
+                        long waitMs = rateLimitWaitMs(out.headers(), sink.capturedBody());
+                        if (waitMs > 0) {
+                            long capped = Math.min(waitMs, cfg.maxRateLimitWaitMs);
+                            Log.warn("attempt %d: 429 rate limit; holding client open, sleeping %ds until provider reset",
+                                    attempts, capped / 1000);
+                            sleepMs(capped);
+                            continue;
+                        }
+                    }
                     if (canRetry(attempts)) {
                         Log.warn("attempt %d: upstream %d; retrying", attempts, out.status());
                         backoff();
@@ -251,7 +277,7 @@ public final class ProxyHandler implements HttpHandler {
         public void onMeta(int s, Map<String, List<String>> h) {
             this.status = s;
             this.responseHeaders = h;
-            if (s >= 500) {
+            if (s >= 500 || s == 429) {
                 return; // capture the body; commit only if retries are exhausted
             }
             try {
@@ -289,7 +315,11 @@ public final class ProxyHandler implements HttpHandler {
             return clientGone;
         }
 
-        /** Forwards a captured 5xx response once retries are exhausted. */
+        byte[] capturedBody() {
+            return captured.toByteArray();
+        }
+
+        /** Forwards a captured 5xx / 429 response once retries are exhausted. */
         void flushDeferred() {
             byte[] b = captured.toByteArray();
             try {
@@ -321,11 +351,68 @@ public final class ProxyHandler implements HttpHandler {
         if (cfg.retryBackoffMs <= 0) {
             return;
         }
+        sleepMs(cfg.retryBackoffMs);
+    }
+
+    private static void sleepMs(long ms) {
         try {
-            Thread.sleep(cfg.retryBackoffMs);
+            Thread.sleep(ms);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /** Timestamp as providers phrase it, e.g. "reset at 2026-10-28 02:52:28". */
+    private static final Pattern RESET_AT =
+            Pattern.compile("(\\d{4}-\\d{2}-\\d{2})[ T](\\d{2}:\\d{2}:\\d{2})");
+
+    /**
+     * Milliseconds until the upstream rate-limit window resets, for a 429
+     * response. Resolution order:
+     * 1. Retry-After header (delta-seconds or HTTP-date)
+     * 2. a "YYYY-MM-DD HH:MM:SS" timestamp in the body, interpreted in the
+     *    proxy's local timezone
+     * Returns 0 when the reset time is unknown.
+     */
+    private static long rateLimitWaitMs(Map<String, List<String>> headers, byte[] body) {
+        List<String> ra = headers.get("retry-after");
+        if (ra != null && !ra.isEmpty()) {
+            String v = ra.get(0).trim();
+            if (!v.isEmpty()) {
+                try {
+                    long secs = Long.parseLong(v);
+                    if (secs > 0) {
+                        return secs * 1000;
+                    }
+                } catch (NumberFormatException notSeconds) {
+                    try {
+                        // HTTP-date form, e.g. "Mon, 26 Oct 2026 21:04:19 GMT"
+                        OffsetDateTime odt =
+                                OffsetDateTime.parse(v, DateTimeFormatter.RFC_1123_DATE_TIME);
+                        long wait = odt.toInstant().toEpochMilli() - System.currentTimeMillis();
+                        if (wait > 0) {
+                            return wait;
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+        if (body != null && body.length > 0) {
+            Matcher m = RESET_AT.matcher(new String(body, StandardCharsets.UTF_8));
+            while (m.find()) {
+                try {
+                    LocalDateTime ldt = LocalDateTime.parse(m.group(0).replace(' ', 'T'));
+                    long wait = ldt.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+                            - System.currentTimeMillis();
+                    if (wait > 0) {
+                        return wait;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return 0;
     }
 
     private URI resolveTarget(HttpExchange ex) {

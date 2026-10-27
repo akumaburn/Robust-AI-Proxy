@@ -7,10 +7,14 @@ Endpoints (base path /v1):
                                              exercise the proxy's idle timeout)
   POST /v1/chat/completions  stream=false  -> JSON completion
   POST /v1/bad                           -> 404 JSON (deterministic error)
+  POST /v1/limit-body                    -> 429 with "reset at <ts>" body (first call only)
+  POST /v1/limit-ra                      -> 429 with Retry-After header (first call only)
+  POST /v1/limit-plain                   -> 429 with no reset info, always
   GET  /v1/models                        -> JSON list
 
 Listens on 127.0.0.1:9911.
 """
+import datetime
 import json
 import threading
 import time
@@ -18,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STALL_SECONDS = 12.0
 _lock = threading.Lock()
-_state = {"stalled": False}
+_state = {"stalled": False, "limit_body": False, "limit_ra": False}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -40,6 +44,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = self._read_body()
+        if self.path == "/v1/limit-body":
+            # first call: 429 with a reset timestamp in the body (+3s)
+            with _lock:
+                if not _state["limit_body"]:
+                    _state["limit_body"] = True
+                    reset = (datetime.datetime.now() + datetime.timedelta(seconds=3)).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    self._send(429, "application/json", json.dumps({
+                        "error": {"message": f"Usage limit reached for 5 hour. "
+                                             f"Your limit will reset at {reset}",
+                                  "type": "rate_limit_error"}}).encode())
+                    return
+        if self.path == "/v1/limit-ra":
+            # first call: 429 with a Retry-After header
+            with _lock:
+                if not _state["limit_ra"]:
+                    _state["limit_ra"] = True
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Retry-After", "3")
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
+        if self.path == "/v1/limit-plain":
+            # always: 429 with no reset info at all
+            self._send(429, "application/json", json.dumps(
+                {"error": {"message": "slow down (mock)", "type": "rate_limit_error"}}).encode())
+            return
         if self.path == "/v1/bad":
             self._send(404, "application/json", json.dumps(
                 {"error": {"message": "not found (mock)", "type": "invalid_request_error"}}).encode())
